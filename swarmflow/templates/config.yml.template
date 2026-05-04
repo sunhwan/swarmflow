@@ -1,0 +1,112 @@
+# swarmflow configuration — see swarmflow/_config.py:DEFAULTS for all keys.
+# All paths are relative to the directory containing this file.
+
+name: {name}
+
+# ── Input files ───────────────────────────────────────────────────────────
+input_pdb:  input.pdb            # bound-state PDB (host + guest, no solvent)
+host_sdf:   host.sdf             # host SDF for GAFF2 parameterization
+guest_sdf:  guest.sdf            # guest SDF for GAFF2 parameterization
+
+# Residue names as they appear in input_pdb
+host_resname:  MOL
+guest_resname: LIG
+
+# Pre-computed force-field overrides (null = compute via antechamber from SDF).
+# Override host charges with q4md-CD RESP charges by pointing host_mol2 at a
+# pre-built mol2 (atom types still GAFF2; only charges change).
+host_mol2:    null
+host_frcmod:  null
+guest_mol2:   null
+guest_frcmod: null
+
+# ── Solvation ─────────────────────────────────────────────────────────────
+box_buffer_ang: 12.0             # TIP3P padding (Å) around solute. Bump to 24+
+                                 # for systems where the guest passes far from
+                                 # the host (avoid PBC self-interaction).
+ion_conc_m:     0.15             # NaCl molarity; ion count derived from waters.
+
+# ── Equilibration ─────────────────────────────────────────────────────────
+# 3-phase: NVT-restrained → NPT-restrained → NPT-free.
+equil_nvt_ps:             100
+equil_npt_restrained_ps:  500
+equil_npt_free_ps:        500
+equil_restraint_k:       10.0    # kcal/mol/Å² on solute heavy atoms
+equil_report:          10000
+
+# ── MMVT anchors (nm, bound → bulk; LAST entry is the bulk milestone) ─────
+anchor_radii:
+  - 0.05
+  - 0.15
+  - 0.25
+  - 0.35
+  - 0.50
+  - 0.60
+  - 0.70
+  - 0.80
+  - 0.90
+  - 1.10
+  - 1.30
+  - 1.50
+  - 1.70
+  - 1.90
+
+# ── MD run settings ───────────────────────────────────────────────────────
+benchmark_steps_per_anchor: 50000
+production_ns_per_anchor:    1.0  # ns per (anchor, swarm K); steps derived
+                                  # from timestep. Bump to 10–30+ for converged
+                                  # production runs.
+md_output_interval:        10000
+
+# Hydrogen Mass Repartitioning. When true: H mass=3.024 amu, MD timestep=4 fs
+# (vs default 2 fs) — roughly 2× speedup downstream of solvate. To toggle on
+# an existing run: flip this, clean post-solvate output, re-run from solvate.
+hmr_enabled: false
+
+# MD temperature (K). Applied to equil, HIDR, swarm, and the seekr2 MMVT
+# model. Changing it after a run requires re-running from the equil stage.
+temperature_K: 300.0
+
+# ── GPUs ──────────────────────────────────────────────────────────────────
+# Anchors are dispatched round-robin across cuda_gpus, mps_per_gpu at a time.
+# Total concurrent = mps_per_gpu × len(cuda_gpus). mps_per_gpu > 1 requires
+# the NVIDIA MPS daemon (nvidia-cuda-mps-server) to be running.
+cuda_gpus:   ["0"]
+mps_per_gpu: 1
+gpu_index:   "0"                 # single-GPU fallback for stages that don't
+                                 # parallelize (equil, check)
+
+# ── Analysis / reporting ──────────────────────────────────────────────────
+bottleneck_threshold:    30      # flag anchors with < this many crossings
+adjust_imbalance_ratio:   5.0    # max(inner,outer)/min ratio that flags an anchor
+adjust_min_gap_nm:        0.05   # don't split if neighbor gap < 2 × this
+
+# ── SMARTS for atom-index discovery ───────────────────────────────────────
+# Defaults target β-cyclodextrin-like hosts. Override for other host classes.
+host_o2_o6_smarts:    'O1CC([O:1])CCC1C([O:2])'   # :1 = O2 face, :2 = O6 face
+host_backbone_smarts: '[#6;r6]'                    # ring carbons (host axis COM)
+
+# Guest principal-axis atoms (null = auto-detect via PCA on heavy atoms).
+# Set to a pair of atom names from input_pdb to override, e.g. ['C3', 'C17'].
+guest_axis_atoms: null
+
+# ── Advanced (uncomment to override; sensible defaults in _config.py) ─────
+# metaD HIDR (stage_hidr_metad) — direction-blind on |COM-COM|.
+# metad_equilibration_ns: 0.05
+# metad_settling_ps:      50.0
+# metad_sigma_nm:         0.05
+# metad_biasfactor:      10.0
+# metad_height_kjmol:     1.0
+
+# Directional SMD HIDR (stage_hidr_smd) — signed projection on host axis.
+# directional_pull_velocity_nm_per_ns: 0.1
+# directional_k_dir:           100.0
+# directional_k_rad:           500.0
+# directional_restraint_k:      10.0
+# directional_initial_equil_ps: 500.0
+# directional_dcd_interval_ps:   50.0
+
+# Swarm-stage post-HIDR relaxation.
+# swarm_relax_ps:           10.0
+# swarm_relax_restraint_k:  10.0
+# swarm_minimize_iter:    2500

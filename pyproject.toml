@@ -1,0 +1,20 @@
+[project]
+name = "swarmflow"
+version = "0.1.0"
+description = "Stage-based driver for seekr2 milestoning + 4-member MMVT swarm"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+swarmflow = "swarmflow.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["swarmflow*"]
+
+[tool.setuptools.package-data]
+swarmflow = ["templates/*.template"]

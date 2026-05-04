@@ -1,6 +1,6 @@
 """
 Stage: ΔG_bind from k_on/k_off, Jacobian-corrected anchor PMF, block-average
-+ sliding-window k_off convergence.
++ sliding-window convergence on BOTH k_off and PMF/ΔG_bind.
 
 Uses ONE seekr2.analyze.Analysis object across all sub-analyses
 (headline, blocks, sliding window). The first extract_data() call reads
@@ -8,6 +8,11 @@ all .out files; subsequent calls hit the cached path
 (analyze.py:348 `files_already_read=True`) and only re-run the per-line
 min_time/max_time filter + small-matrix kinetics solve. Two orders of
 magnitude faster than constructing a new Analysis for each block/window.
+
+Block/window PMF + ΔG_bind reuse the bulk-plateau and bound-region anchor
+indices identified on the FULL run, so the time-resolved ΔG measures how
+the population in those fixed regions evolves — not how the regions
+themselves move (which would conflate two different sources of variance).
 """
 
 import os
@@ -30,6 +35,37 @@ def _run_block(analysis, t_min_ps, t_max_ps):
         return None
 
 
+def _block_pmf_and_dG(analysis, n_anchors, cell_vol, RT,
+                      bulk_ref_idx, bound_idx, V0):
+    """Recompute Jacobian-corrected PMF + Method-2 ΔG_bind from the
+    pi_alpha currently held by `analysis` (after a re-filtered
+    process_data_samples). Returns (fe_corr_array, dG_kcalmol).
+    Both regions are passed in pre-computed from the full run so the
+    block-to-block comparison is on a fixed bound/bulk definition."""
+    pi_alpha = np.asarray(analysis.pi_alpha).flatten()[:n_anchors]
+    rho = np.where(cell_vol > 0, pi_alpha / cell_vol, 0.0)
+    rho_pos = np.where(rho > 0, rho, np.nan)
+    if not np.isfinite(np.nanmax(rho_pos)):
+        return np.full(n_anchors, np.nan), float('nan')
+    fe_corr = -RT * np.log(rho_pos / np.nanmax(rho_pos))
+    fe_corr = fe_corr - np.nanmin(fe_corr)
+
+    if bulk_ref_idx is None or bound_idx is None \
+            or len(bulk_ref_idx) == 0 or len(bound_idx) == 0:
+        return fe_corr, float('nan')
+
+    pi_bound = float(pi_alpha[bound_idx].sum())
+    pi_bulk  = float(pi_alpha[bulk_ref_idx].sum())
+    V_bulk_total = float(cell_vol[bulk_ref_idx].sum())
+    if pi_bulk <= 0 or pi_bound <= 0:
+        return fe_corr, float('nan')
+    K_eq = pi_bound * V_bulk_total / pi_bulk / V0
+    if not (K_eq > 0):
+        return fe_corr, float('nan')
+    dG = -RT * float(np.log(K_eq))
+    return fe_corr, dG
+
+
 def stage_kinetics(args):
     import matplotlib
     matplotlib.use('Agg')
@@ -47,6 +83,11 @@ def stage_kinetics(args):
     pmf_png = (P.work / 'kinetics_pmf.png').resolve()
     win_png = (P.work / 'kinetics_k_off_windows.png').resolve()
     win_csv = (P.work / 'kinetics_k_off_windows.csv').resolve()
+    pmf_blocks_png = (P.work / 'kinetics_pmf_blocks.png').resolve()
+    pmf_blocks_csv = (P.work / 'kinetics_pmf_blocks.csv').resolve()
+    dG_blocks_csv  = (P.work / 'kinetics_dG_blocks.csv').resolve()
+    dG_win_png     = (P.work / 'kinetics_dG_windows.png').resolve()
+    dG_win_csv     = (P.work / 'kinetics_dG_windows.csv').resolve()
 
     print(f'[kinetics] loading {model_xml}')
     curdir = os.getcwd()
@@ -161,6 +202,8 @@ def stage_kinetics(args):
     # data.
     V0 = 1.66054   # V° = 1/(N_A · 1 M) in nm³
     n_bulk_ref = int(getattr(args, 'pmf_bulk_ref_anchors', 3) or 3)
+    bulk_ref_idx = None        # exposed to block/window loops below;
+    bound_idx    = None        # both stay None if region detection fails
     finite_mask = np.isfinite(fe_corr)
     finite_idx = np.where(finite_mask)[0]
     if len(finite_idx) >= n_bulk_ref + 2:
@@ -287,12 +330,17 @@ def stage_kinetics(args):
             if k_b is None:
                 block_results.append({'label': label, 'error': 'analyze failed'})
             else:
+                fe_b, dG_b = _block_pmf_and_dG(
+                    analysis, n, cell_vol, RT,
+                    bulk_ref_idx, bound_idx, V0)
                 block_results.append({
                     'label':     label,
                     't_min':     t_min,
                     't_max':     t_max,
                     'k_off':     k_b,
                     'k_off_err': analysis.k_off_error,
+                    'fe_corr':   fe_b,
+                    'dG_pmf':    dG_b,
                 })
         print(f'  ({n_blocks} blocks in {_time.time()-t_block_start:.1f} s '
               f'using cached Analysis)')
@@ -306,8 +354,11 @@ def stage_kinetics(args):
                 err_s = (f'  ± {r["k_off_err"]:.2e}'
                          if r["k_off_err"] else '')
                 t_lab = f'[{r["t_min"]:.0f}–{r["t_max"]:.0f} ps]'
+                dG_s = (f'  ΔG = {r["dG_pmf"]:+.2f} kcal/mol'
+                        if np.isfinite(r.get('dG_pmf', float('nan')))
+                        else '  ΔG = --')
                 print(f'  {r["label"]:10s} {t_lab:18s}: '
-                      f'k_off = {r["k_off"]:.3e} s^-1{err_s}')
+                      f'k_off = {r["k_off"]:.3e} s^-1{err_s}{dG_s}')
 
         valid = [r for r in block_results if 'k_off' in r and r['k_off'] > 0]
         if len(valid) >= 2:
@@ -336,6 +387,84 @@ def stage_kinetics(args):
                 print('  ⚠ borderline — late drift 20-50%; consider extending')
             else:
                 print('  ✓ late-time blocks agree within statistical noise')
+
+        # ── ΔG_bind block drift ───────────────────────────────────────────
+        # Absolute drift in kcal/mol. RT≈0.6 at 300 K, so 0.5 kcal/mol is
+        # ~kT — anything larger is real movement, not noise.
+        valid_dG = [r for r in block_results
+                    if np.isfinite(r.get('dG_pmf', float('nan')))]
+        if len(valid_dG) >= 2:
+            dG_late = valid_dG[-1]['dG_pmf']
+            dG_prev = valid_dG[-2]['dG_pmf']
+            dG_drift = abs(dG_late - dG_prev)
+            adj_dG_drifts = [abs(valid_dG[i]['dG_pmf']
+                                 - valid_dG[i-1]['dG_pmf'])
+                             for i in range(1, len(valid_dG))]
+            print(f'\n  ΔG late drift (block {len(valid_dG)} vs '
+                  f'{len(valid_dG)-1}): {dG_drift:.2f} kcal/mol')
+            if adj_dG_drifts:
+                print(f'  max adjacent-block ΔG drift: '
+                      f'{max(adj_dG_drifts):.2f} kcal/mol')
+            if dG_drift > 1.0:
+                print('  ⚠ NOT CONVERGED — late ΔG drifts >1 kcal/mol')
+            elif dG_drift > 0.5:
+                print('  ⚠ borderline — late ΔG drifts 0.5-1.0 kcal/mol')
+            else:
+                print('  ✓ late ΔG agrees within ~kT')
+
+        # ── Block PMF overlay plot + CSV ──────────────────────────────────
+        # One W(r) curve per block. Visual check on whether the well shape
+        # and barrier height are stable across quarters; if blocks disagree
+        # on the shape (not just the absolute values), the milestoning is
+        # not equilibrated.
+        valid_blocks = [r for r in block_results if 'fe_corr' in r]
+        if valid_blocks:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            cmap = plt.get_cmap('viridis')
+            for i, r in enumerate(valid_blocks):
+                color = cmap(i / max(len(valid_blocks) - 1, 1))
+                lab = (f'{r["label"]} '
+                       f'[{r["t_min"]:.0f}–{r["t_max"]:.0f} ps]')
+                if np.isfinite(r.get('dG_pmf', float('nan'))):
+                    lab += f'  ΔG={r["dG_pmf"]:+.2f}'
+                ax.plot(radii, r['fe_corr'], 'o-', color=color, label=lab)
+            ax.plot(radii, fe_corr, 's--', color='black', alpha=0.7,
+                    label='full run')
+            ax.set_xlabel('COM-COM distance (nm)')
+            ax.set_ylabel('W(r) (kcal/mol)')
+            ax.set_title(f'{C.name} — block PMF overlay '
+                         f'({len(valid_blocks)} blocks)')
+            ax.axhline(0, color='black', lw=0.5, alpha=0.3)
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8, loc='best')
+            fig.tight_layout()
+            fig.savefig(pmf_blocks_png, dpi=150)
+            plt.close(fig)
+
+            with open(pmf_blocks_csv, 'w') as f:
+                cols = ['anchor', 'radius_nm', 'W_full_kcalmol']
+                cols += [f'W_block{i+1}_kcalmol' for i in range(len(valid_blocks))]
+                f.write(','.join(cols) + '\n')
+                for ai, r_a in enumerate(radii):
+                    row = [str(ai), f'{r_a:.3f}',
+                           f'{fe_corr[ai]:.4f}' if np.isfinite(fe_corr[ai]) else '']
+                    for r in valid_blocks:
+                        v = r['fe_corr'][ai] if ai < len(r['fe_corr']) else float('nan')
+                        row.append(f'{v:.4f}' if np.isfinite(v) else '')
+                    f.write(','.join(row) + '\n')
+
+            with open(dG_blocks_csv, 'w') as f:
+                f.write('block,t_min_ps,t_max_ps,k_off_per_s,dG_pmf_kcalmol\n')
+                for r in block_results:
+                    if 'error' in r:
+                        continue
+                    dG = r.get('dG_pmf', float('nan'))
+                    dG_s = f'{dG:.4f}' if np.isfinite(dG) else ''
+                    f.write(f'{r["label"]},{r["t_min"]:.1f},{r["t_max"]:.1f},'
+                            f'{r["k_off"]:.6e},{dG_s}\n')
+            print(f'\n  block PMF overlay -> {pmf_blocks_png}')
+            print(f'  block PMF csv     -> {pmf_blocks_csv}')
+            print(f'  block ΔG csv      -> {dG_blocks_csv}')
 
         # ── Per-anchor block-drift summary ────────────────────────────────
         # Global k_off can hide problems where a few specific anchors are
@@ -412,7 +541,7 @@ def stage_kinetics(args):
 
         analysis.num_error_samples = 0    # bootstrap off — too expensive per window
         t_window_start = _time.time()
-        k_off_list, t_mid_list = [], []
+        k_off_list, t_mid_list, dG_list = [], [], []
         for w in range(n_windows):
             t_min = w * step_ps
             t_max = t_min + window_ps
@@ -422,6 +551,10 @@ def stage_kinetics(args):
             if k_w is not None:
                 k_off_list.append(k_w)
                 t_mid_list.append(0.5 * (t_min + t_max) * 1e-3)   # ns
+                _, dG_w = _block_pmf_and_dG(
+                    analysis, n, cell_vol, RT,
+                    bulk_ref_idx, bound_idx, V0)
+                dG_list.append(dG_w)
         print(f'  {len(k_off_list)} windows in '
               f'{_time.time()-t_window_start:.1f} s')
 
@@ -444,6 +577,36 @@ def stage_kinetics(args):
             print(f'  csv  -> {win_csv}')
             print(f'  • flat tail = converged')
             print(f'  • monotonic drift in the late half = still equilibrating')
+
+            # ── Sliding-window ΔG_bind ───────────────────────────────────
+            # Same windows, ΔG_bind via Method 2 (population-direct).
+            # Plotted on a linear y axis since ΔG sits in a narrow range
+            # (a couple of kcal/mol); easier to read drift than k_off's
+            # log-scale spikes.
+            valid_dG = [(t, g) for t, g in zip(t_mid_list, dG_list)
+                        if np.isfinite(g)]
+            if valid_dG:
+                t_dG, vals_dG = zip(*valid_dG)
+                fig, ax = plt.subplots(figsize=(8, 5))
+                ax.plot(t_dG, vals_dG, 'o-', color='tab:green')
+                ax.set_xlabel('window center (ns)')
+                ax.set_ylabel(r'$\Delta G_{bind}$ (kcal/mol)')
+                ax.set_title(f'{C.name} — sliding-window $\\Delta G_{{bind}}$ '
+                             f'({n_windows} × {window_ps:.0f} ps)')
+                ax.axhline(0, color='black', lw=0.5, alpha=0.3)
+                ax.grid(alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(dG_win_png, dpi=150)
+                plt.close(fig)
+                with open(dG_win_csv, 'w') as f:
+                    f.write('window_center_ns,dG_pmf_kcalmol\n')
+                    for t, g in zip(t_mid_list, dG_list):
+                        f.write(f'{t:.3f},{g:.4f}\n' if np.isfinite(g)
+                                else f'{t:.3f},\n')
+                print(f'  ΔG plot -> {dG_win_png}')
+                print(f'  ΔG csv  -> {dG_win_csv}')
+            else:
+                print('  ΔG sliding-window: bound/bulk regions undefined; skipped')
         else:
             print('  no successful windows — sampling too short?')
 

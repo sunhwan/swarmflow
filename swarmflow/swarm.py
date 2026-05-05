@@ -399,6 +399,57 @@ def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
               flush=True)
         sys.exit(2)
 
+    # Pre-flight: guard against the cleanse_anchor_outputs cascade.
+    # When restart=False (no checkpoint for THIS K), seekr2 calls
+    # `cleanse_anchor_outputs` which deletes EVERYTHING in prod/ —
+    # not just files for swarm_idx, but every other K's checkpoints,
+    # .out files, and .dcd files too (seekr2/modules/runner_openmm.py:157).
+    # Refuse to launch if any other K in the same prod_dir has data we
+    # would otherwise lose.
+    if not restart:
+        import re as _re
+        other_k_with_data = set()
+        for cf in prod_dir.glob('backup.checkpoint.swarm_*'):
+            try:
+                other_k = int(cf.name.rsplit('_', 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if other_k != swarm_idx:
+                other_k_with_data.add(other_k)
+        # DCDs and .out files for other K's count too — even without a
+        # checkpoint, those are real simulation data the user may want.
+        for f in list(prod_dir.glob('mmvt*.dcd')) \
+                + list(prod_dir.glob('mmvt.swarm_*.restart*.out')):
+            try:
+                if f.stat().st_size <= 100:
+                    continue
+            except OSError:
+                continue
+            m = _re.search(r'swarm_(\d+)', f.name)
+            if not m:
+                continue
+            other_k = int(m.group(1))
+            if other_k != swarm_idx:
+                other_k_with_data.add(other_k)
+        if other_k_with_data:
+            print(
+                f'[swarm] anchor {anchor_idx} swarm {swarm_idx}: REFUSING to '
+                f'launch with force_overwrite=True (no checkpoint for K='
+                f'{swarm_idx}, but K={sorted(other_k_with_data)} have data '
+                f'in {prod_dir}). seekr2.cleanse_anchor_outputs is anchor-'
+                f'scoped — it would wipe ALL K data, not just K={swarm_idx}. '
+                f'To proceed, either:\n'
+                f'  (a) restore backup.checkpoint.swarm_{swarm_idx} from '
+                f'a previous run,\n'
+                f'  (b) re-run Phase 1 to regenerate state.swarm_{swarm_idx}'
+                f'.xml (deletes only that K`s state file, then a fresh '
+                f'run will checkpoint cleanly), or\n'
+                f'  (c) move/delete the surviving K`s data in {prod_dir} '
+                f'if you intentionally want a clean anchor reset.',
+                flush=True,
+            )
+            sys.exit(2)
+
     # Spawn the bounce-rate watchdog. Daemon thread = dies with the
     # subprocess; uses os._exit on detection so we don't have to wire a
     # stop signal back into seekr2's tight inner loop.
@@ -633,7 +684,12 @@ def stage_swarm(args):
     # ── Phase 1a: collect all (anchor,k) → (source_pdb, out_xml) jobs ──
     # Cell-containment + cached-state checks are fast; do them in main process.
     # Defer only the OpenMM minimize+relax work to subprocesses.
-    anchor_to_states = {}     # alpha -> list of state_files
+    # alpha -> {k: state_file_path}. Dict, NOT list — the K index is the
+    # *identity* of the swarm member (controls .out / .dcd suffix and
+    # statefile name). A list shifts indices when an entry is dropped, so
+    # downstream "for k, path in state_files.items()" stays correct even
+    # when Phase 1 drops some K's for an anchor but not others.
+    anchor_to_states = {}
     relax_jobs = []           # list of (anchor, k, tag, prmtop, source_pdb, out_xml)
 
     main_anchor_iter = 0
@@ -649,7 +705,7 @@ def stage_swarm(args):
             continue
         r_main = round(r_main_val, 4)
 
-        state_files = []
+        state_files = {}   # k -> out_xml_str
         for k, tag, root_dir in SOURCES:
             if k not in source_models:
                 continue
@@ -702,7 +758,7 @@ def stage_swarm(args):
                                    out_xml_str, 0.0,
                                    float(r_inner), float(r_outer),
                                    float(r_target_mid)))
-            state_files.append(out_xml_str)
+            state_files[k] = out_xml_str
 
         if state_files:
             anchor_to_states[alpha] = state_files
@@ -733,12 +789,13 @@ def stage_swarm(args):
                     if proc.exitcode != 0:
                         msg = f'anchor {a:2d} swarm {kk} ({tt}): RELAX FAILED ' \
                               f'(exitcode={proc.exitcode}), see {lp}'
-                        # Drop the bad state from the list so seekr2 doesn't
-                        # try to load a (missing or partial) state.swarm_K.xml
-                        lst = anchor_to_states.get(a, [])
-                        if oxml in lst:
-                            lst.remove(oxml)
-                        if not lst:
+                        # Drop the bad K from the dict so seekr2 doesn't
+                        # try to load a (missing or partial) state.swarm_K.xml.
+                        # Dict-keyed-by-K so the surviving K's keep their
+                        # identity — list-and-shift would clip the highest K.
+                        d = anchor_to_states.get(a, {})
+                        d.pop(kk, None)
+                        if not d:
                             anchor_to_states.pop(a, None)
                         if bar is not None: bar.write(f'[swarm] {msg}')
                         else:               print(f'[swarm] {msg}')
@@ -840,10 +897,13 @@ def stage_swarm(args):
     # K-major spreads the 4 K-members across all anchors per wave so the
     # full 8-slot capacity stays filled until the last wave.
     jobs = []   # list of (anchor_idx, swarm_idx, state_file)
-    max_k = max(len(s) for s in anchor_to_states.values())
-    for k in range(max_k):
+    # Iterate K explicitly. state_files is a {k: path} dict; k is the true
+    # swarm-K identity, not a list position. Drops in Phase 1 leave gaps
+    # in K which we silently skip rather than re-pack.
+    all_ks = sorted({k for s in anchor_to_states.values() for k in s})
+    for k in all_ks:
         for alpha, state_files in sorted(anchor_to_states.items()):
-            if k < len(state_files):
+            if k in state_files:
                 jobs.append((alpha, k, state_files[k]))
 
     print(f'\n[swarm] launching {len(jobs)} (anchor, swarm) jobs '

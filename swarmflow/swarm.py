@@ -244,6 +244,100 @@ def _relax_and_save_state(prmtop_file, coords_ang, struct_box, struct_atoms,
 
 # ── Per (anchor, swarm-member) worker (subprocess) ───────────────────────────
 
+# Defaults for the bounce-rate pathology watchdog. Normal MMVT in this
+# system runs ~1-5 bounces/ps; the pathology mode (trajectory parked just
+# outside a milestone, integrator ringing every step) hits ~200+ bounces/ps.
+# 50/ps splits the gap. Grace window of 100 ps avoids flagging the
+# transient at the very start of a run.
+BOUNCE_RATE_THRESHOLD_PER_PS = 50.0
+BOUNCE_RATE_GRACE_SIM_PS     = 100.0
+BOUNCE_RATE_POLL_SEC         = 30.0
+
+
+def _bounce_rate_watchdog(prod_dir, swarm_idx,
+                          threshold_per_ps=BOUNCE_RATE_THRESHOLD_PER_PS,
+                          grace_sim_ps=BOUNCE_RATE_GRACE_SIM_PS,
+                          poll_sec=BOUNCE_RATE_POLL_SEC):
+    """Daemon thread that watches the most recent
+    `mmvt.swarm_K.restart*.out` for this (anchor, swarm_K) and aborts the
+    subprocess if the cumulative bounce-rate exceeds threshold after the
+    grace window. Symptom of a velocity-flip MMVT trajectory parked just
+    outside a milestone — recording millions of integrator-induced
+    crossings while the configuration is effectively frozen. See
+    diagnostic notes in the BCD/cholesterol project log.
+
+    On detection: removes `backup.checkpoint.swarm_K` to prevent a future
+    `swarmflow swarm` invocation from resuming the same bad state, writes
+    a `PATHOLOGY.swarm_K` sentinel describing the failure, and calls
+    os._exit(2). The corrupt .out/.dcd files are left in place so the user
+    can inspect them; they should be moved or deleted before re-running.
+    """
+    import os, glob, re, time
+    while True:
+        time.sleep(poll_sec)
+        try:
+            files = glob.glob(
+                os.path.join(prod_dir, f'mmvt.swarm_{swarm_idx}.restart*.out'))
+            if not files:
+                continue
+            files.sort(key=lambda f: int(re.search(r'restart(\d+)', f).group(1)))
+            latest = files[-1]
+            cnt = 0
+            last_t = 0.0
+            with open(latest) as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln or ln.startswith('#') \
+                            or ln.startswith('CHECKPOINT'):
+                        continue
+                    parts = ln.split(',')
+                    if len(parts) != 3:
+                        continue
+                    cnt += 1
+                    try:
+                        t = float(parts[2])
+                        if t > last_t:
+                            last_t = t
+                    except Exception:
+                        pass
+            if last_t < grace_sim_ps:
+                continue
+            rate = cnt / max(last_t, 1e-9)
+            if rate <= threshold_per_ps:
+                continue
+            # Pathology detected. Remove the corrupt checkpoint so a future
+            # resume doesn't re-trigger the same state, write a sentinel,
+            # and exit hard. daemon=True watchdog can't be cleanly joined,
+            # so os._exit terminates the whole subprocess.
+            msg = (f'[watchdog] PATHOLOGY DETECTED on swarm_{swarm_idx}: '
+                   f'{cnt:,} bounces in {last_t:.1f} ps = {rate:.1f}/ps '
+                   f'(threshold {threshold_per_ps:.0f}/ps after '
+                   f'{grace_sim_ps:.0f} ps grace). Aborting subprocess; '
+                   f'removing backup.checkpoint.swarm_{swarm_idx}.')
+            print(msg, flush=True)
+            ckpt = os.path.join(prod_dir, f'backup.checkpoint.swarm_{swarm_idx}')
+            if os.path.exists(ckpt):
+                try:
+                    os.remove(ckpt)
+                except OSError:
+                    pass
+            sentinel = os.path.join(prod_dir, f'PATHOLOGY.swarm_{swarm_idx}')
+            try:
+                with open(sentinel, 'w') as f:
+                    f.write(msg + '\n')
+                    f.write(f'latest_out_file: {latest}\n')
+            except OSError:
+                pass
+            os._exit(2)
+        except Exception:
+            # Don't let watchdog errors take down the subprocess. Log and
+            # keep polling — false-negative is preferable to crashing the
+            # production run.
+            import traceback
+            traceback.print_exc()
+            continue
+
+
 def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
                       log_path=None, total_steps=None):
     """
@@ -251,6 +345,10 @@ def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
     Outputs are written with the .swarm_K suffix because seekr2 uses
     swarm_index in the output basename. stdout/stderr → log_path so the
     parent's terminal isn't flooded by OpenMM StateDataReporter output.
+
+    A daemon `_bounce_rate_watchdog` thread runs alongside and aborts the
+    subprocess if a velocity-flip-MMVT pathology develops (cumulative
+    bounce rate > 50/ps after 100 ps grace).
 
     total_steps overrides model.calculation_settings.num_production_steps so
     that bumping production_steps_per_anchor in config.yml extends an
@@ -287,6 +385,30 @@ def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
     print(f'[swarm] anchor {anchor_idx} swarm {swarm_idx}: '
           f'{"resume" if restart else "start"} on GPU {gpu_index} '
           f'({total_steps:,} steps)', flush=True)
+
+    # Pre-flight: if a sentinel from a previous aborted run is present,
+    # refuse to run this (anchor, K) until the user clears it. Prevents
+    # silently restarting a known-bad state.
+    prod_dir = (Path(model.anchor_rootdir) / anchor.directory
+                / anchor.production_directory)
+    sentinel = prod_dir / f'PATHOLOGY.swarm_{swarm_idx}'
+    if sentinel.exists():
+        print(f'[swarm] anchor {anchor_idx} swarm {swarm_idx}: pathology '
+              f'sentinel present at {sentinel}; refusing to run. '
+              f'Inspect and remove (along with bad .out/.dcd) before retry.',
+              flush=True)
+        sys.exit(2)
+
+    # Spawn the bounce-rate watchdog. Daemon thread = dies with the
+    # subprocess; uses os._exit on detection so we don't have to wire a
+    # stop signal back into seekr2's tight inner loop.
+    import threading
+    threading.Thread(
+        target=_bounce_rate_watchdog,
+        args=(str(prod_dir), swarm_idx),
+        daemon=True,
+    ).start()
+
     try:
         seekr2_run.run_openmm(
             model, anchor_idx, restart, total_steps,

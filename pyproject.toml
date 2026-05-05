@@ -5,6 +5,9 @@ description = "Stage-based driver for seekr2 milestoning + 4-member MMVT swarm"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
 swarmflow = "swarmflow.cli:main"
 

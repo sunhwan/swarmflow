@@ -43,14 +43,28 @@ def stage_hidr_metad(args):
     import seekrtools.hidr.hidr as srt_hidr
     import seekrtools.hidr.hidr_base as hidr_base
 
-    # Load the seekr2 model that setup built (root/model.xml). The model's
-    # anchor.amber_params.pdb_coordinates_filename for the bound anchor
-    # already points at complex-equil.pdb (copied into building/ by
-    # setup), so seekrtools sees a valid starting structure.
+    # Load the seekr2 model that setup built (root/model.xml). setup seeds
+    # every MD anchor with complex-equil.pdb (used as-is by hidr_smd, which
+    # overwrites per-anchor pdb_coordinates_filename after its SMD pull).
+    # seekrtools.hidr's destination walker, however, refuses to run when
+    # every anchor already has a starting structure ("No destinations
+    # found"). Clear pdb_coordinates_filename on non-bound, non-bulk anchors
+    # so seekrtools sees only the bound anchor as seeded and walks outward.
     curdir = os.getcwd()
     os.chdir(P.root)
     model = base.load_model('model.xml')
     os.chdir(curdir)
+
+    n_cleared = 0
+    for anchor in model.anchors:
+        if anchor.bulkstate or anchor.endstate:
+            continue
+        if anchor.amber_params and anchor.amber_params.pdb_coordinates_filename:
+            anchor.amber_params.pdb_coordinates_filename = ''
+            n_cleared += 1
+    if n_cleared:
+        print(f'[hidr_metad] cleared pdb_coordinates_filename on {n_cleared} '
+              f'non-bound anchors (so seekrtools has destinations)')
 
     # Convert ns/ps to step counts at the live (HMR-aware) timestep.
     dt_ps = float(C.production_timestep_ps)

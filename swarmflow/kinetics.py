@@ -202,13 +202,31 @@ def stage_kinetics(args):
     # data.
     V0 = 1.66054   # V° = 1/(N_A · 1 M) in nm³
     n_bulk_ref = int(getattr(args, 'pmf_bulk_ref_anchors', 3) or 3)
+    # Per-user override: skip these anchor indices when picking the bulk
+    # plateau. Useful when one anchor is a clear W_3D outlier driven by an
+    # undersampled rate-matrix entry rather than real plateau density.
+    bulk_exclude_str = str(getattr(args, 'bulk_exclude', '') or '').strip()
+    bulk_exclude = set()
+    if bulk_exclude_str:
+        for tok in bulk_exclude_str.split(','):
+            tok = tok.strip()
+            if tok:
+                try:
+                    bulk_exclude.add(int(tok))
+                except ValueError:
+                    print(f'  [warn] --bulk-exclude: ignoring non-integer {tok!r}')
     bulk_ref_idx = None        # exposed to block/window loops below;
     bound_idx    = None        # both stay None if region detection fails
     finite_mask = np.isfinite(fe_corr)
     finite_idx = np.where(finite_mask)[0]
-    if len(finite_idx) >= n_bulk_ref + 2:
-        # Last n_bulk_ref MD anchors as the "bulk" plateau reference.
-        bulk_ref_idx = finite_idx[-n_bulk_ref:]
+    # Apply --bulk-exclude only to plateau selection, not to bound detection.
+    plateau_candidates = np.array(
+        [i for i in finite_idx if int(i) not in bulk_exclude], dtype=int)
+    if len(plateau_candidates) >= n_bulk_ref + 2:
+        # Last n_bulk_ref non-excluded MD anchors as the "bulk" plateau reference.
+        bulk_ref_idx = plateau_candidates[-n_bulk_ref:]
+        if bulk_exclude:
+            print(f'  [bulk] excluding anchors {sorted(bulk_exclude)} from plateau')
         W_bulk = float(np.mean(fe_corr[bulk_ref_idx]))
 
         # Bound region: contiguous from anchor 0 up to (not including) the

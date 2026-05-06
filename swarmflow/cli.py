@@ -51,6 +51,11 @@ def _kinetics_args(p):
     g.add_argument('--skip-sliding-window', dest='skip_sliding_window',
                    action='store_true',
                    help='Skip the sliding-window k_off plot')
+    g.add_argument('--bulk-exclude', dest='bulk_exclude', default='',
+                   help='Comma-separated anchor indices to exclude from the '
+                        'bulk-plateau average. Use when one anchor is a '
+                        'visible outlier in W_3D (e.g. due to undersampled '
+                        'rate-matrix entries). Example: --bulk-exclude 13')
 
 
 def _extract_args(p):
@@ -79,7 +84,7 @@ _CLI_ONLY = {
     'frames', 'every', 'full',
     'num_error_samples', 'n_blocks', 'n_windows',
     'skip_block_average', 'skip_sliding_window',
-    'pmf_bulk_ref_anchors',
+    'pmf_bulk_ref_anchors', 'bulk_exclude',
     'project_dir', 'force',
     # Helper-tool flags (clean, diagnose, merge_hidr, verify_bound)
     'mode', 'yes', 'campaigns', 'by_anchor', 'out',

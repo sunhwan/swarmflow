@@ -56,6 +56,21 @@ DEFAULTS = {
     'metad_sigma_nm':               0.05,    # Gaussian width along the spherical CV (nm)
     'metad_biasfactor':            10.0,     # well-tempered metaD bias factor (dimensionless)
     'metad_height_kjmol':           1.0,     # Gaussian height in kJ/mol
+
+    # Browndye2 association-rate stage. Active only when bd_enabled=True
+    # AND both PQR paths exist on disk. setup wires these into the seekr2
+    # Model_input.browndye_settings_input; seekr2.prepare auto-builds
+    # b_surface/ under root/. stage_bd then runs the b-surface trajectories
+    # via seekr2.run.run(model, 'b_surface', ...).
+    'bd_enabled':                       False,
+    'bd_binary_directory':              '',     # path to browndye2 bin dir; '' = look on PATH
+    'bd_receptor_pqr':                  None,   # path (rel to project dir) to receptor PQR; null disables BD
+    'bd_ligand_pqr':                    None,   # path (rel to project dir) to ligand PQR; null disables BD
+    'bd_apbs_grid_spacing':             0.5,    # APBS grid spacing in Å
+    'bd_num_b_surface_trajectories':    10000,  # number of b-surface trajectories (paper used 110000)
+    'bd_n_threads':                     1,      # threads for nam_simulation
+    'bd_ions':                          [],     # list of dicts: {'radius':1.2, 'charge':1.0, 'conc':0.15}
+
     'bottleneck_threshold':            30,
     'adjust_imbalance_ratio':         5.0,
     'adjust_min_gap_nm':             0.05,
@@ -86,7 +101,7 @@ DEFAULTS = {
 }
 
 STAGES = ['param', 'solvate', 'equil', 'check', 'setup', 'report',
-          'adjust', 'hidr_smd', 'hidr_metad', 'swarm', 'kinetics',
+          'adjust', 'hidr_smd', 'hidr_metad', 'bd', 'swarm', 'kinetics',
           'extract', 'analyze']
 
 

@@ -359,7 +359,13 @@ def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
     if log_path is not None:
         sys.stdout = open(log_path, 'w', buffering=1)
         sys.stderr = sys.stdout
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_index)
+    # Respect an inherited CUDA_VISIBLE_DEVICES (e.g. SLURM's --gres=gpu:1
+    # allocation per array task). Overwriting it here would silently bypass
+    # the scheduler's GPU isolation — every concurrent task's workers would
+    # land on physical GPU 0 regardless of what SLURM allocated. Only set
+    # the var when the parent left it unset (standalone / single-host runs).
+    if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_index)
     import seekr2.modules.common_base as common_base
     import seekr2.run as seekr2_run
 

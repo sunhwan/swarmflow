@@ -23,6 +23,7 @@ from .report     import stage_report
 from .adjust     import stage_adjust
 from .hidr_smd   import stage_hidr_smd
 from .hidr_metad import stage_hidr_metad
+from .bd         import stage_bd
 from .swarm      import stage_swarm
 from .kinetics   import stage_kinetics
 from .extract    import stage_extract
@@ -40,6 +41,7 @@ STAGE_FNS = {
     'hidr_metad': stage_hidr_metad,
     # Back-compat alias — old --stage hidr_alts still works
     'hidr_alts':  stage_hidr_smd,
+    'bd':         stage_bd,
     'swarm':      stage_swarm,
     'kinetics':   stage_kinetics,
     'extract':    stage_extract,

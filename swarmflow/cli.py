@@ -25,8 +25,8 @@ from importlib.resources import files
 from pathlib import Path
 
 from swarmflow import STAGE_FNS, STAGES, load_config, paths
-from swarmflow.tools import (cmd_clean, cmd_diagnose, cmd_merge_hidr,
-                             cmd_verify_bound)
+from swarmflow.tools import (cmd_bd_prep, cmd_clean, cmd_diagnose,
+                             cmd_merge_hidr, cmd_verify_bound)
 from swarmflow.tools.clean import MODES as _CLEAN_MODES
 
 warnings.filterwarnings('ignore')
@@ -68,9 +68,17 @@ def _extract_args(p):
                    help='Include solvent + ions (default: host+guest only)')
 
 
+def _bd_args(p):
+    g = p.add_argument_group('bd options')
+    g.add_argument('--force-overwrite', dest='force_overwrite',
+                   action='store_true',
+                   help='Re-run b-surface trajectories even if results.xml exists')
+
+
 _STAGE_ARGS = {
     'kinetics': _kinetics_args,
     'extract':  _extract_args,
+    'bd':       _bd_args,
 }
 
 
@@ -176,6 +184,14 @@ def _build_parser():
                           help='Geometry summary of the 4 equilibrated bound states')
     _add_global_options(vb_p)
 
+    bp_p = sub.add_parser('bd_prep',
+                          help='Generate receptor.pqr + ligand.pqr from '
+                               'work_<name>/solvated.{prmtop,pdb} for the BD stage')
+    bp_p.add_argument('--force-overwrite', dest='force_overwrite',
+                      action='store_true',
+                      help='Regenerate PQRs even if they already exist')
+    _add_global_options(bp_p)
+
     return p
 
 
@@ -223,6 +239,7 @@ def _cmd_status(args):
     has_hidr = lambda: (has_root() and any(P.root.glob(
         'anchor_*/building/hidr_metadyn_at_*_0.pdb')))
     has_orient = lambda: any(P.work.glob('orientation_*.csv'))
+    has_bd     = lambda: any((P.root / 'b_surface').glob('results*.xml'))
 
     rows = [
         ('param',      P.complex_dir / 'vac.prmtop',  'vacuum complex'),
@@ -234,6 +251,7 @@ def _cmd_status(args):
         ('adjust',     None,                          '(prints to stdout)'),
         ('hidr_smd',   has_hidr,                      'anchor_*/building/hidr_*'),
         ('hidr_metad', has_hidr,                      'anchor_*/building/hidr_*'),
+        ('bd',         has_bd,                        'root/b_surface/results*.xml'),
         ('swarm',      has_mmvt,                      'anchor_*/prod/mmvt*.out'),
         ('kinetics',   P.work / 'kinetics_pmf.csv',   'kinetics_pmf.csv'),
         ('extract',    None,                          '(user-specified frames)'),
@@ -301,6 +319,9 @@ def main():
     elif args.command == 'verify_bound':
         _load_C(args)
         cmd_verify_bound(args)
+    elif args.command == 'bd_prep':
+        _load_C(args)
+        cmd_bd_prep(args)
     else:
         raise SystemExit(f'unknown command: {args.command!r}')
 

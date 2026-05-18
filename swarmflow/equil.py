@@ -110,6 +110,34 @@ def stage_equil(args):
         pos = positions[i].value_in_unit(unit.angstrom)
         atom.xx, atom.xy, atom.xz = pos
     struct.box = [a, b, c_, alpha, beta, gamma]
+
+    # Center host COM in box center and re-wrap all residues as whole units.
+    # OpenMM's enforcePeriodicBox=True wraps atoms individually; if the guest
+    # COM lands near a periodic boundary it can end up in a different image from
+    # the host, making the raw COM-COM distance misleading and breaking seekr2's
+    # CV calculation.  Centering the host + residue-COM wrapping eliminates that.
+    box_lengths = np.array([a, b, c_])
+    box_center  = box_lengths / 2.0
+    host_atoms  = [at for at in struct.atoms if at.residue.name == C.host_resname]
+    if host_atoms:
+        host_com = np.array([[at.xx, at.xy, at.xz] for at in host_atoms]).mean(0)
+        shift = box_center - host_com
+        for at in struct.atoms:
+            at.xx += shift[0]; at.xy += shift[1]; at.xz += shift[2]
+        for res in struct.residues:
+            ratoms = list(res.atoms)
+            com = np.array([[at.xx, at.xy, at.xz] for at in ratoms]).mean(0)
+            wrap = -np.floor(com / box_lengths) * box_lengths
+            if np.any(wrap != 0.0):
+                for at in ratoms:
+                    at.xx += wrap[0]; at.xy += wrap[1]; at.xz += wrap[2]
+        guest_atoms = [at for at in struct.atoms if at.residue.name == C.guest_resname]
+        if guest_atoms:
+            guest_com = np.array([[at.xx, at.xy, at.xz] for at in guest_atoms]).mean(0)
+            d = np.linalg.norm(guest_com - box_center)
+            print(f'[equil] re-centered: host COM → box center; '
+                  f'guest COM {d:.2f} Å from box center')
+
     struct.save(str(P.equil_pdb), overwrite=True)
     struct.save(str(P.equil_rst7), format='rst7', overwrite=True)
 

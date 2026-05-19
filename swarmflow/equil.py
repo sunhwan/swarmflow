@@ -19,7 +19,7 @@ def stage_equil(args):
     from openmm.app import (AmberPrmtopFile, AmberInpcrdFile, Simulation,
                              PME, HBonds, StateDataReporter)
     from openmm import (LangevinMiddleIntegrator, Platform, MonteCarloBarostat,
-                        CustomExternalForce)
+                        CustomExternalForce, CustomCentroidBondForce)
     import openmm.unit as unit
 
     print('[equil] loading system...')
@@ -30,8 +30,31 @@ def stage_equil(args):
         nonbondedMethod=PME, nonbondedCutoff=0.9 * unit.nanometer,
         constraints=HBonds, rigidWater=True, hydrogenMass=None)
 
+    # Pre-center host COM in box before any restraints or dynamics. Tutorial
+    # structures often place the host near a box face; restraining atoms there
+    # equilibrates the water shell asymmetrically and HIDR geometric transforms
+    # can push the guest across a periodic boundary.
+    pre = pmd.load_file(str(P.solvated_top))
+    solute_resnames = {C.host_resname, C.guest_resname}
+    host_idx = [i for i, at in enumerate(pre.atoms) if at.residue.name == C.host_resname]
+    pos0_nm = np.array([[v.value_in_unit(unit.nanometer) for v in inpcrd.positions[i]]
+                         for i in range(len(pre.atoms))])
+    if inpcrd.boxVectors is not None:
+        bv0 = inpcrd.boxVectors
+        box0_nm = np.array([np.linalg.norm(
+            [bv0[i][j].value_in_unit(unit.nanometer) for j in range(3)])
+            for i in range(3)])
+        host_com0 = pos0_nm[host_idx].mean(0)
+        shift_nm = box0_nm / 2.0 - host_com0
+        if np.linalg.norm(shift_nm) > 0.001:
+            pos0_nm += shift_nm
+            print(f'[equil] pre-centering: shifted host COM '
+                  f'{np.linalg.norm(shift_nm)*10:.2f} Å to box center')
+
     # Positional restraint on solute heavy atoms (k_r is a global parameter
-    # so we can release restraints by setting k_r=0 without rebuilding context)
+    # so we can release restraints by setting k_r=0 without rebuilding context).
+    # Anchors are set to the pre-centered positions so Phases 1+2 keep the
+    # host at box center.
     restraint = CustomExternalForce("k_r*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
     restraint.addGlobalParameter("k_r",
         C.equil_restraint_k * unit.kilocalories_per_mole / unit.angstrom**2)
@@ -39,12 +62,10 @@ def stage_equil(args):
     restraint.addPerParticleParameter("y0")
     restraint.addPerParticleParameter("z0")
 
-    pre = pmd.load_file(str(P.solvated_top))
-    solute_resnames = {C.host_resname, C.guest_resname}
     n_restrained = 0
     for i, atom in enumerate(pre.atoms):
         if atom.residue.name in solute_resnames and atom.element != 1:
-            pos = inpcrd.positions[i].value_in_unit(unit.nanometer)
+            pos = pos0_nm[i]
             restraint.addParticle(i, [pos[0], pos[1], pos[2]])
             n_restrained += 1
     system.addForce(restraint)
@@ -61,7 +82,7 @@ def stage_equil(args):
     platform = Platform.getPlatformByName('CUDA')
     simulation = Simulation(prmtop.topology, system, integrator, platform,
                             {'CudaDeviceIndex': C.gpu_index, 'CudaPrecision': 'mixed'})
-    simulation.context.setPositions(inpcrd.positions)
+    simulation.context.setPositions(unit.Quantity(pos0_nm.tolist(), unit.nanometer))
     if inpcrd.boxVectors is not None:
         simulation.context.setPeriodicBoxVectors(*inpcrd.boxVectors)
 
@@ -90,8 +111,30 @@ def stage_equil(args):
     simulation.step(npt_restr_steps)
 
     print(f'\n[equil] Phase 3: NPT {C.equil_npt_free_ps} ps '
-          f'({npt_free_steps} steps), restraints OFF')
+          f'({npt_free_steps} steps), restraints OFF, host COM tethered')
     simulation.context.setParameter('k_r', 0.0)
+
+    # Soft centroid restraint on host COM to prevent drift during free NPT.
+    # 1 kcal/mol/Å² on a ~147-atom centroid ≈ 0.007 kcal/mol/Å² per atom —
+    # gentle enough not to bias density but firm enough to keep the host away
+    # from the periodic boundary. Target: box center (= Phase 1+2 anchor pos
+    # for the host, since we pre-centered above).
+    state_p2 = simulation.context.getState(getPositions=True)
+    bv_p2 = state_p2.getPeriodicBoxVectors()
+    box_p2_nm = np.array([bv_p2[i][i].value_in_unit(unit.nanometer) for i in range(3)])
+    cx, cy, cz = box_p2_nm / 2.0
+    k_com_omm = (1.0 * unit.kilocalories_per_mole / unit.angstrom**2
+                ).value_in_unit(unit.kilojoules_per_mole / unit.nanometer**2)
+    com_rest = CustomCentroidBondForce(
+        1, "0.5*k_com*((x1-cx)^2+(y1-cy)^2+(z1-cz)^2)")
+    com_rest.addGlobalParameter('k_com', k_com_omm)
+    com_rest.addGlobalParameter('cx', float(cx))
+    com_rest.addGlobalParameter('cy', float(cy))
+    com_rest.addGlobalParameter('cz', float(cz))
+    com_rest.addGroup(host_idx)
+    com_rest.addBond([0])
+    system.addForce(com_rest)
+    simulation.context.reinitialize(preserveState=True)
     simulation.step(npt_free_steps)
 
     state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)

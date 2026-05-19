@@ -407,9 +407,11 @@ def _directional_pull(prmtop_file, start_pdb, start_rst7,
                     * unit.kilocalories_per_mole / unit.angstrom**2
                     ).value_in_unit(unit.kilojoules_per_mole / unit.nanometer**2)
 
-    # Build simulation. Timestep follows hmr_enabled (4 fs with HMR, 2 fs
-    # otherwise) — single source of truth in C.production_timestep_ps.
-    timestep_ps = float(C.production_timestep_ps)
+    # Use 2 fs for the SMD pull regardless of hmr_enabled. Through-cavity
+    # transit forces the guest through high-energy configurations not present
+    # in free equilibration; the HMR prmtop is valid at 2 fs (conservative
+    # but stable). Same rationale as _relax_transformed_complex.
+    timestep_ps = 0.002
     integrator = LangevinMiddleIntegrator(
         float(C.temperature_K) * unit.kelvin, 1.0 / unit.picosecond, timestep_ps * unit.picoseconds)
     platform = Platform.getPlatformByName('CUDA')

@@ -415,6 +415,13 @@ def _directional_pull(prmtop_file, start_pdb, start_rst7,
     simulation.context.setPositions(unit.Quantity(coords_ang.tolist(), unit.angstrom))
     if inpcrd.boxVectors is not None:
         simulation.context.setPeriodicBoxVectors(*inpcrd.boxVectors)
+
+    # Minimize before any dynamics. Campaigns without a prior transform (tag A)
+    # skip _relax_transform and receive the raw equil coordinates directly; at
+    # the production timestep (4 fs with HMR) those coordinates can have small
+    # clashes that cause NaN on the very first steps. Minimization is cheap and
+    # harmless for campaigns that already went through _relax_transform.
+    simulation.minimizeEnergy(maxIterations=2500)
     simulation.context.setVelocitiesToTemperature(float(C.temperature_K) * unit.kelvin)
 
     # DCD reporter for post-hoc inspection of the pull trajectory.

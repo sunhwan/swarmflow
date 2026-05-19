@@ -405,56 +405,31 @@ def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
               flush=True)
         sys.exit(2)
 
-    # Pre-flight: guard against the cleanse_anchor_outputs cascade.
+    # Pre-flight: protect other K's data from seekr2's cleanse_anchor_outputs.
     # When restart=False (no checkpoint for THIS K), seekr2 calls
-    # `cleanse_anchor_outputs` which deletes EVERYTHING in prod/ —
-    # not just files for swarm_idx, but every other K's checkpoints,
-    # .out files, and .dcd files too (seekr2/modules/runner_openmm.py:157).
-    # Refuse to launch if any other K in the same prod_dir has data we
-    # would otherwise lose.
+    # cleanse_anchor_outputs which wipes the entire prod/ directory, including
+    # completed K's DCD/out files. Temporarily rename other K's artifacts
+    # so the cleanse only removes THIS K's stale files; restore them afterward.
+    import re as _re
+    _saved: dict = {}   # {temp_path: original_path}
     if not restart:
-        import re as _re
-        other_k_with_data = set()
-        for cf in prod_dir.glob('backup.checkpoint.swarm_*'):
-            try:
-                other_k = int(cf.name.rsplit('_', 1)[1])
-            except (ValueError, IndexError):
-                continue
-            if other_k != swarm_idx:
-                other_k_with_data.add(other_k)
-        # DCDs and .out files for other K's count too — even without a
-        # checkpoint, those are real simulation data the user may want.
-        for f in list(prod_dir.glob('mmvt*.dcd')) \
-                + list(prod_dir.glob('mmvt.swarm_*.restart*.out')):
-            try:
-                if f.stat().st_size <= 100:
-                    continue
-            except OSError:
-                continue
+        _other_k_patterns = (
+            list(prod_dir.glob('backup.checkpoint.swarm_*'))
+            + list(prod_dir.glob('mmvt*.dcd'))
+            + list(prod_dir.glob('mmvt.swarm_*.restart*.out'))
+        )
+        for f in _other_k_patterns:
             m = _re.search(r'swarm_(\d+)', f.name)
             if not m:
                 continue
-            other_k = int(m.group(1))
-            if other_k != swarm_idx:
-                other_k_with_data.add(other_k)
-        if other_k_with_data:
-            print(
-                f'[swarm] anchor {anchor_idx} swarm {swarm_idx}: REFUSING to '
-                f'launch with force_overwrite=True (no checkpoint for K='
-                f'{swarm_idx}, but K={sorted(other_k_with_data)} have data '
-                f'in {prod_dir}). seekr2.cleanse_anchor_outputs is anchor-'
-                f'scoped — it would wipe ALL K data, not just K={swarm_idx}. '
-                f'To proceed, either:\n'
-                f'  (a) restore backup.checkpoint.swarm_{swarm_idx} from '
-                f'a previous run,\n'
-                f'  (b) re-run Phase 1 to regenerate state.swarm_{swarm_idx}'
-                f'.xml (deletes only that K`s state file, then a fresh '
-                f'run will checkpoint cleanly), or\n'
-                f'  (c) move/delete the surviving K`s data in {prod_dir} '
-                f'if you intentionally want a clean anchor reset.',
-                flush=True,
-            )
-            sys.exit(2)
+            if int(m.group(1)) == swarm_idx:
+                continue
+            temp = f.with_name(f'.swarm_save_{f.name}')
+            try:
+                f.rename(temp)
+                _saved[temp] = f
+            except OSError:
+                pass
 
     # Spawn the bounce-rate watchdog. Daemon thread = dies with the
     # subprocess; uses os._exit on detection so we don't have to wire a
@@ -479,6 +454,12 @@ def _run_swarm_member(model_xml, anchor_idx, swarm_idx, state_file, gpu_index,
         if log_path is not None:
             sys.stdout.flush()
         sys.exit(1)
+    finally:
+        for temp, orig in _saved.items():
+            try:
+                temp.rename(orig)
+            except OSError:
+                pass
 
 
 # ── Stage entrypoint ─────────────────────────────────────────────────────────
@@ -875,7 +856,17 @@ def stage_swarm(args):
         if not single_pdb.exists():
             continue
         # Derive a multi-frame filename, e.g. hidr_metadyn_at_0.100_0.pdb → ..._swarm.pdb
-        multi_pdb = building / single_pdb.name.replace('_0.pdb', '_swarm.pdb')
+        # Falls back gracefully when pdb_coordinates_filename is complex-equil.pdb
+        # (no _0.pdb suffix): strip trailing _0 from the stem if present, append _swarm.
+        # If model.xml already points at a _swarm.pdb (written by a previous run),
+        # reuse it directly — don't create a _swarm_swarm.pdb with wrong frame count.
+        stem = single_pdb.stem
+        if stem.endswith('_swarm'):
+            multi_pdb = single_pdb
+        else:
+            if stem.endswith('_0'):
+                stem = stem[:-2]
+            multi_pdb = building / f'{stem}_swarm.pdb'
         if not multi_pdb.exists():
             _write_multiframe_pdb(single_pdb, n_frames, multi_pdb)
         # Point the anchor's pdb_coordinates_filename at the multi-frame PDB

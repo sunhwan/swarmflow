@@ -159,7 +159,11 @@ def _relax_transformed_complex(prmtop, src_pdb, src_rst7, transform_chain,
             n_restrained += 1
     system.addForce(restraint)
 
-    dt_ps = float(C.production_timestep_ps)
+    # Always relax at 2 fs regardless of hmr_enabled. A geometric transform can
+    # place the guest in a high-energy configuration that is too stiff for the
+    # 4 fs production timestep even after minimization. This mirrors equil.py's
+    # conservative choice; the time cost for 500 ps at 2 fs vs 4 fs is small.
+    dt_ps = 0.002
     integrator = LangevinMiddleIntegrator(
         float(C.temperature_K) * unit.kelvin, 1.0 / unit.picosecond, dt_ps * unit.picoseconds)
     platform = Platform.getPlatformByName('CUDA')

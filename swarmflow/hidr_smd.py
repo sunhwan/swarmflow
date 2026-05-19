@@ -696,6 +696,12 @@ def _run_one_campaign(tag, transform_chain, exit_sign):
         cell_bounds_nm.append((r_in, r_out))
 
     pull_dcd = root_dir_abs / 'pull.dcd'
+    # Tag A uses complex-equil.rst7 directly (already equilibrated at 2 fs).
+    # The 500 ps pre-pull hold is designed for post-flip campaigns that need to
+    # relax after a geometric transform; for A it is redundant and can crash at
+    # 4 fs (HMR) due to slow-building instabilities under the CV restraint.
+    # Pass 5.0 so only the mandatory 5 ps warm-up runs.
+    init_equil = 5.0 if is_main else float(C.directional_initial_equil_ps)
     _directional_pull(
         P.solvated_top, out_pdb_abs, out_rst7_abs,
         host_idx_atoms, guest_idx_atoms, O2_idx, O6_idx,
@@ -706,7 +712,7 @@ def _run_one_campaign(tag, transform_chain, exit_sign):
         C.cuda_gpus[0],
         tolerance_nm=C.directional_tolerance_nm,
         max_pull_time_ps=C.directional_max_pull_time_ps,
-        initial_equil_ps=C.directional_initial_equil_ps,
+        initial_equil_ps=init_equil,
         k_rad_kcal_per_mol_A2=C.directional_k_rad,
         dcd_path=pull_dcd,
         cell_bounds_nm=cell_bounds_nm)

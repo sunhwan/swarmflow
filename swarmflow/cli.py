@@ -43,6 +43,8 @@ def _kinetics_args(p):
                    help='Bootstrap error samples (default: 1000)')
     g.add_argument('--n-blocks', dest='n_blocks', type=int, default=4,
                    help='Block-average count (default: 4 quarters)')
+    g.add_argument('--window-fraction', dest='window_fraction', type=float, default=2.5,
+                   help='Window width = T_max / window_fraction (default 2.5 → 40%% of total)')
     g.add_argument('--n-windows', dest='n_windows', type=int, default=30,
                    help='Sliding-window count (default: 30)')
     g.add_argument('--skip-block-average', dest='skip_block_average',
@@ -56,6 +58,12 @@ def _kinetics_args(p):
                         'bulk-plateau average. Use when one anchor is a '
                         'visible outlier in W_3D (e.g. due to undersampled '
                         'rate-matrix entries). Example: --bulk-exclude 13')
+    g.add_argument('--per-campaign', dest='per_campaign', action='store_true',
+                   help='Also analyse each HIDR campaign (swarm_0..3) '
+                        'separately and Boltzmann-combine the 4 ΔG/k_off '
+                        'values. Diagnostic for guests where orientational '
+                        'sub-states do not interconvert on the production '
+                        'timescale.')
 
 
 def _extract_args(p):
@@ -90,9 +98,9 @@ _STAGE_ARGS = {
 _CLI_ONLY = {
     'config', 'command', 'from_', 'to',
     'frames', 'every', 'full',
-    'num_error_samples', 'n_blocks', 'n_windows',
+    'num_error_samples', 'n_blocks', 'n_windows', 'window_fraction',
     'skip_block_average', 'skip_sliding_window',
-    'pmf_bulk_ref_anchors', 'bulk_exclude',
+    'pmf_bulk_ref_anchors', 'bulk_exclude', 'per_campaign',
     'project_dir', 'force',
     # Helper-tool flags (clean, diagnose, merge_hidr, verify_bound)
     'mode', 'yes', 'campaigns', 'by_anchor', 'out',

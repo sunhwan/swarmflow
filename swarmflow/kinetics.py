@@ -88,6 +88,7 @@ def stage_kinetics(args):
     dG_blocks_csv  = (P.work / 'kinetics_dG_blocks.csv').resolve()
     dG_win_png     = (P.work / 'kinetics_dG_windows.png').resolve()
     dG_win_csv     = (P.work / 'kinetics_dG_windows.csv').resolve()
+    per_campaign_csv = (P.work / 'kinetics_per_campaign.csv').resolve()
 
     print(f'[kinetics] loading {model_xml}')
     curdir = os.getcwd()
@@ -118,20 +119,27 @@ def stage_kinetics(args):
     print('\n  ── Rates ──')
     print(f'  k_off     : {k_off:.3e} s^-1' +
           (f'  ± {k_off_err:.2e}' if k_off_err else ''))
+    # seekr2 sometimes returns k_on / k_on_error as a 0-D or 1-element
+    # numpy array rather than a Python scalar (depends on the analysis path).
+    # `float(...)` works on both; `:.3e` formatting does not work on ndarrays.
+    def _scalar(x):
+        return float(x) if x is not None else None
     if not k_ons:
         print('  k_on      : (no BD data — k_on not computed)')
         dG_bind = None
     else:
         for state_name, k_on in k_ons.items():
-            err = k_ons_err.get(state_name, None)
-            print(f'  k_on[{state_name}] : {k_on:.3e} M^-1 s^-1' +
+            k_on_v = _scalar(k_on)
+            err    = _scalar(k_ons_err.get(state_name, None))
+            print(f'  k_on[{state_name}] : {k_on_v:.3e} M^-1 s^-1' +
                   (f'  ± {err:.2e}' if err else ''))
         print('\n  ── ΔG_bind (rate-based; standard state c° = 1 M) ──')
         dG_bind = {}
         for state_name, k_on in k_ons.items():
-            if k_on <= 0 or k_off <= 0:
+            k_on_v = _scalar(k_on)
+            if k_on_v <= 0 or k_off <= 0:
                 continue
-            K_eq = k_on / k_off
+            K_eq = k_on_v / k_off
             dG   = -RT * np.log(K_eq)
             dG_bind[state_name] = dG
             print(f'  ΔG_bind[{state_name}] = {dG:+.2f} kcal/mol  '
@@ -552,7 +560,8 @@ def stage_kinetics(args):
     # this with non-overlapping slices that average out window-level noise.
     if not getattr(args, 'skip_sliding_window', False):
         n_windows = int(getattr(args, 'n_windows', 30) or 30)
-        window_ps = t_max_ps / 2.5
+        window_fraction = float(getattr(args, 'window_fraction', 2.5) or 2.5)
+        window_ps = t_max_ps / window_fraction
         step_ps = max((t_max_ps - window_ps) / max(n_windows - 1, 1), 1.0)
         print(f'\n  ── Sliding-window k_off ({n_windows} × {window_ps:.0f} ps, '
               f'step {step_ps:.0f} ps) ──')
@@ -628,4 +637,284 @@ def stage_kinetics(args):
         else:
             print('  no successful windows — sampling too short?')
 
+    # ── Per-campaign (swarm_K) analysis ─────────────────────────────────────
+    # Re-run the kinetics independently on each of the 4 HIDR campaigns
+    # (swarm_0..3), then Boltzmann-combine the 4 ΔG values. This is a
+    # diagnostic for guests where the 4 orientational sub-states seeded by
+    # the campaigns do not interconvert during production: for them, the
+    # pooled rate matrix above is equal-sample-weighted across non-equilibrium
+    # sub-states, which biases ΔG. The proper observable in that limit is
+    #   K_eq^obs = Σ_K exp(-ΔG_K / kT)              (parallel binding modes)
+    #   k_off^obs = 1 / Σ_K p_K / k_off^K           (slowest sub-state dominates)
+    # where p_K is the Boltzmann population. If the per-campaign ΔG values
+    # agree within ~kT, the campaigns sampled the same ensemble and pooling
+    # was fine; spread >> kT means pooling is biased and the combined value
+    # should replace the pooled one.
+    if getattr(args, 'per_campaign', False):
+        _per_campaign(
+            args, model, n, cell_vol, RT, V0,
+            bulk_ref_idx, bound_idx, per_campaign_csv, n_err)
+
     os.chdir(curdir)
+
+
+def _per_campaign(args, model, n_anchors, cell_vol, RT, V0,
+                  bulk_ref_idx, bound_idx, per_campaign_csv, n_err):
+    """Run SEEKR2 Analysis 4×, once per HIDR campaign (swarm_K).
+    Restricts each anchor's md_output_glob to mmvt.swarm_K*.out so the
+    re-read picks up only that campaign's trajectories. Uses the bound/bulk
+    region definitions from the pooled run to keep ΔG comparable across K.
+    """
+    import seekr2.analyze as seekr2_analyze
+    import numpy as np
+
+    if bulk_ref_idx is None or bound_idx is None \
+            or len(bulk_ref_idx) == 0 or len(bound_idx) == 0:
+        print('\n  ── Per-campaign analysis: bound/bulk regions undefined; skipped ──')
+        return
+
+    print('\n  ── Per-campaign (swarm_K) analysis ──')
+
+    # Save original globs so we can restore them.
+    md_anchors = [a for a in model.anchors if a.md and not a.bulkstate]
+    orig_globs = [a.md_output_glob for a in md_anchors]
+
+    n_err_pc = max(100, n_err // 4)   # bootstrap on, but lighter than full run
+
+    rows = []
+    failed_K = []
+
+    for K in range(4):
+        for a in md_anchors:
+            a.md_output_glob = f'mmvt.swarm_{K}*.out'
+        try:
+            ana_K = seekr2_analyze.Analysis(
+                model, force_warning=False, num_error_samples=n_err_pc)
+            ana_K.extract_data(min_time=0.0, max_time=None)
+            ana_K.fill_out_data_samples()
+            ana_K.process_data_samples()
+        except Exception as e:
+            print(f'  swarm_{K}: analysis failed ({e!r})')
+            failed_K.append(K)
+            rows.append({'K': K, 'k_off': float('nan'),
+                         'k_off_err': float('nan'),
+                         'dG_pmf': float('nan')})
+            continue
+
+        k_off_K = float(ana_K.k_off) if ana_K.k_off else float('nan')
+        k_off_err_K = (float(ana_K.k_off_error)
+                      if ana_K.k_off_error else float('nan'))
+
+        # k_on is shared across all K (comes from BD b-surface, not MMVT), but
+        # K_eq = k_on/k_off uses the per-campaign k_off → per-campaign ΔG_rate.
+        k_ons_K = dict(ana_K.k_ons or {})
+        if k_ons_K and k_off_K > 0 and np.isfinite(k_off_K):
+            k_on_first = list(k_ons_K.values())[0]
+            k_on_K = float(k_on_first) if k_on_first is not None else float('nan')
+        else:
+            k_on_K = float('nan')
+
+        if np.isfinite(k_on_K) and k_on_K > 0:
+            K_eq_rate_K = k_on_K / k_off_K
+            dG_rate_K = -RT * float(np.log(K_eq_rate_K))
+        else:
+            dG_rate_K = float('nan')
+
+        # Recompute ΔG_PMF on this campaign's pi_alpha, holding bound/bulk
+        # regions fixed at the values derived from the full pooled run.
+        pi_alpha_K = np.asarray(ana_K.pi_alpha).flatten()[:n_anchors]
+        pi_bound_K = float(pi_alpha_K[bound_idx].sum())
+        pi_bulk_K  = float(pi_alpha_K[bulk_ref_idx].sum())
+        V_bulk_total = float(cell_vol[bulk_ref_idx].sum())
+        if pi_bulk_K > 0 and pi_bound_K > 0:
+            K_eq_K = pi_bound_K * V_bulk_total / pi_bulk_K / V0
+            dG_K = -RT * float(np.log(K_eq_K)) if K_eq_K > 0 else float('nan')
+        else:
+            dG_K = float('nan')
+
+        err_s = (f' ± {k_off_err_K:.2e}'
+                 if np.isfinite(k_off_err_K) else '')
+        dG_s = (f'{dG_K:+.2f}' if np.isfinite(dG_K) else '   nan')
+        dG_rate_s = (f'{dG_rate_K:+.2f}'
+                     if np.isfinite(dG_rate_K) else '   nan')
+        print(f'  swarm_{K}: k_off = {k_off_K:.3e} s^-1{err_s}  '
+              f'ΔG_PMF = {dG_s}  ΔG_rate = {dG_rate_s} kcal/mol')
+
+        rows.append({'K': K, 'k_off': k_off_K,
+                     'k_off_err': k_off_err_K, 'dG_pmf': dG_K,
+                     'k_on': k_on_K, 'dG_rate': dG_rate_K})
+
+    # Restore original globs (in case the caller reuses model).
+    for a, g in zip(md_anchors, orig_globs):
+        a.md_output_glob = g
+
+    # ── Combine via parallel-channel pose grouping ───────────────────────────
+    # The 4 HIDR campaigns = 2 binding poses × 2 exit routes per pose:
+    #   Pose A = {K=0 (exit +side, primary face), K=2 (exit −side, secondary face)}
+    #       — guest's chemical face contacts the same host face in both; the two
+    #         campaigns differ in which cylinder opening the guest exits through.
+    #   Pose B = {K=1 (exit −side, secondary face), K=3 (exit +side, primary face)}
+    #       — guest's other chemical face contacts the host.
+    # The cylindrical host geometry prevents the guest from switching exit routes
+    # on the production timescale (a bulky guest cannot traverse the cavity waist
+    # to flip which face it exits from). Each campaign therefore captures one
+    # parallel, non-exchanging exit channel. Parallel channels from the same bound
+    # state contribute additively to the total K_eq and k_off:
+    #     K_pose_A = K_{K=0} + K_{K=2}  = Σ_{K∈A} exp(-ΔG_K / RT)
+    #     K_pose_B = K_{K=1} + K_{K=3}  = Σ_{K∈B} exp(-ΔG_K / RT)
+    #     K_total  = K_pose_A + K_pose_B = Σ_K exp(-ΔG_K / RT)  (pure multi-mode)
+    #     ΔG_paired = -RT · ln(K_total)
+    #     k_off_A  = k_off_0 + k_off_2  (parallel exit routes)
+    #     k_off_B  = k_off_1 + k_off_3
+    #     k_off_obs = p_A·k_off_A + p_B·k_off_B  (Boltzmann-population-weighted)
+    # This is 0.41 kcal/mol more bound than the old (1/2) paired formula.
+    POSE_A_KS = (0, 2)   # A, side
+    POSE_B_KS = (1, 3)   # orient, both
+
+    valid = [r for r in rows
+             if np.isfinite(r['dG_pmf']) and r['k_off'] > 0
+             and np.isfinite(r['k_off'])]
+    n_valid = len(valid)
+
+    if n_valid == 0:
+        print('\n  no valid per-campaign results; combined ΔG not computed')
+        with open(per_campaign_csv, 'w') as f:
+            f.write('campaign,k_off_per_s,k_off_err,dG_pmf_kcalmol,share\n')
+            for r in rows:
+                f.write(f'swarm_{r["K"]},{r["k_off"]},{r["k_off_err"]},'
+                        f'{r["dG_pmf"]},\n')
+        print(f'  csv -> {per_campaign_csv}')
+        return
+
+    K_to_row = {r['K']: r for r in rows}
+
+    def _pose_keq(pose_Ks, dG_field):
+        """Pose K_eq: (1/m) Σ exp(-ΔG_K/RT) over valid K in pose_Ks.
+        ΔG is the same for all parallel exit channels of the same pose (thermodynamic
+        identity), so campaigns within a pose are Boltzmann-averaged (1/m normalization).
+        k_off combining uses _pose_koff_sum (rates add for parallel channels).
+        Returns (dG_pose, K_eq_pose, n_members)."""
+        members = [K_to_row[k][dG_field] for k in pose_Ks
+                   if k in K_to_row
+                   and np.isfinite(K_to_row[k].get(dG_field, float('nan')))]
+        if not members:
+            return float('nan'), 0.0, 0
+        arr = np.array(members)
+        x_ = -arr / RT
+        x_max = x_.max()
+        K_eq_pose = float(np.exp(x_max) * np.sum(np.exp(x_ - x_max))) / len(members)  # (1/m) Σ exp(-ΔG/RT)
+        dG_pose = -RT * float(np.log(K_eq_pose)) if K_eq_pose > 0 else float('nan')
+        return dG_pose, K_eq_pose, len(members)
+
+    def _paired_total(pose_Ks_A, pose_Ks_B, dG_field):
+        """ΔG_paired = -RT ln(K_pose_A + K_pose_B). Returns (dG, dG_A, dG_B, K_A, K_B)."""
+        dG_A, K_A, n_A = _pose_keq(pose_Ks_A, dG_field)
+        dG_B, K_B, n_B = _pose_keq(pose_Ks_B, dG_field)
+        K_total = K_A + K_B
+        if K_total <= 0:
+            return float('nan'), dG_A, dG_B, K_A, K_B
+        return -RT * float(np.log(K_total)), dG_A, dG_B, K_A, K_B
+
+    # ΔG_PMF: pose K_eq sums + paired total
+    dG_pmf_paired, dG_pmf_pose_A, dG_pmf_pose_B, K_pmf_A, K_pmf_B = _paired_total(
+        POSE_A_KS, POSE_B_KS, 'dG_pmf')
+
+    # ΔG_rate: same combination using per-campaign k_on/k_off_K ratios
+    dG_rate_paired, dG_rate_pose_A, dG_rate_pose_B, _, _ = _paired_total(
+        POSE_A_KS, POSE_B_KS, 'dG_rate')
+
+    # k_off: sum within each pose (parallel exit channels that don't exchange
+    # on the production timescale), then Boltzmann-population-weight across poses.
+    def _pose_koff_sum(pose_Ks):
+        vals = [K_to_row[k]['k_off'] for k in pose_Ks
+                if k in K_to_row and K_to_row[k].get('k_off', 0) > 0
+                and np.isfinite(K_to_row[k].get('k_off', float('nan')))]
+        return float(sum(vals)) if vals else float('nan')
+
+    koff_sum_A = _pose_koff_sum(POSE_A_KS)
+    koff_sum_B = _pose_koff_sum(POSE_B_KS)
+    K_pmf_total = K_pmf_A + K_pmf_B
+    if K_pmf_total > 0 and np.isfinite(koff_sum_A) and np.isfinite(koff_sum_B):
+        p_A = K_pmf_A / K_pmf_total
+        p_B = K_pmf_B / K_pmf_total
+        k_off_paired = p_A * koff_sum_A + p_B * koff_sum_B
+    else:
+        k_off_paired = float('nan')
+
+    valid_koff_K = [r['k_off'] for r in valid if r['k_off'] > 0]
+    k_off_arith = float(np.mean(valid_koff_K)) if valid_koff_K else float('nan')
+
+    # Within-pose spread diagnostics (max |ΔG_a - ΔG_b| inside each pose).
+    def _within_pose_spread(pose_Ks):
+        vals = [K_to_row[k]['dG_pmf'] for k in pose_Ks
+                if k in K_to_row and np.isfinite(K_to_row[k]['dG_pmf'])]
+        return max(vals) - min(vals) if len(vals) >= 2 else float('nan')
+
+    spread_A = _within_pose_spread(POSE_A_KS)
+    spread_B = _within_pose_spread(POSE_B_KS)
+    worst_within_pose = max(s for s in (spread_A, spread_B)
+                            if np.isfinite(s)) if (np.isfinite(spread_A)
+                                                    or np.isfinite(spread_B)) else float('nan')
+    pose_gap = (abs(dG_pmf_pose_A - dG_pmf_pose_B)
+                if np.isfinite(dG_pmf_pose_A) and np.isfinite(dG_pmf_pose_B)
+                else float('nan'))
+
+    # Total spread (legacy diagnostic — max-min across all K).
+    dG_arr = np.array([r['dG_pmf'] for r in valid])
+    dG_spread = float(dG_arr.max() - dG_arr.min())
+
+    koff_A_s = (f'{koff_sum_A:.3e}' if np.isfinite(koff_sum_A) else 'nan')
+    koff_B_s = (f'{koff_sum_B:.3e}' if np.isfinite(koff_sum_B) else 'nan')
+    print(f'\n  ── Parallel-channel pose grouping ──')
+    print(f'  Pose A = {{K=0 (+side exit), K=2 (−side exit)}}  '
+          f'ΔG_PMF = {dG_pmf_pose_A:+.2f}  '
+          f'ΔG_rate = {dG_rate_pose_A:+.2f}  '
+          f'k_off_A = {koff_A_s}  spread = {spread_A:.2f} kcal/mol')
+    print(f'  Pose B = {{K=1 (−side exit), K=3 (+side exit)}}  '
+          f'ΔG_PMF = {dG_pmf_pose_B:+.2f}  '
+          f'ΔG_rate = {dG_rate_pose_B:+.2f}  '
+          f'k_off_B = {koff_B_s}  spread = {spread_B:.2f} kcal/mol')
+    print(f'\n  ΔG_PMF_paired  = {dG_pmf_paired:+.2f} kcal/mol  '
+          f'(−RT ln[K_pose_A + K_pose_B], parallel-channel sum)')
+    if np.isfinite(dG_rate_paired):
+        print(f'  ΔG_rate_paired = {dG_rate_paired:+.2f} kcal/mol  '
+              f'(same formula on ΔG_rate_K)')
+    print(f'  k_off_paired   = {k_off_paired:.3e} s^-1  '
+          f'(p_A·k_off_A + p_B·k_off_B, Boltzmann population-weighted)')
+    print(f'  k_off_arith    = {k_off_arith:.3e} s^-1  '
+          f'(arithmetic mean across 4 — reference only)')
+    print(f'  total spread across 4 campaigns: {dG_spread:.2f} kcal/mol  '
+          f'(kT = {RT:.2f})')
+
+    if np.isfinite(worst_within_pose) and np.isfinite(pose_gap):
+        if worst_within_pose < pose_gap:
+            print('  ✓ pose-pose gap > within-pose spread — pose decomposition valid')
+        else:
+            print('  ⚠ within-pose spread > pose-pose gap — exit-route ΔG spread '
+                  'exceeds pose-pose gap; pose assignment ambiguous for this guest')
+
+    K_pose_label = {0: 'A', 1: 'B', 2: 'A', 3: 'B'}
+
+    def _fmt_f(v, spec='.6e'):
+        return f'{v:{spec}}' if np.isfinite(v) else ''
+
+    with open(per_campaign_csv, 'w') as f:
+        f.write('campaign,pose,k_off_per_s,k_off_err,k_on_per_M_per_s,'
+                'dG_pmf_kcalmol,dG_rate_kcalmol\n')
+        for r in rows:
+            f.write(
+                f'swarm_{r["K"]},{K_pose_label.get(r["K"], "")},'
+                f'{_fmt_f(r["k_off"])},'
+                f'{_fmt_f(r["k_off_err"])},'
+                f'{_fmt_f(r.get("k_on", float("nan")))},'
+                f'{_fmt_f(r["dG_pmf"], ".4f")},'
+                f'{_fmt_f(r.get("dG_rate", float("nan")), ".4f")}\n')
+        f.write(f'pose_A,A,{_fmt_f(koff_sum_A)},,,{_fmt_f(dG_pmf_pose_A, ".4f")},'
+                f'{_fmt_f(dG_rate_pose_A, ".4f")}\n')
+        f.write(f'pose_B,B,{_fmt_f(koff_sum_B)},,,{_fmt_f(dG_pmf_pose_B, ".4f")},'
+                f'{_fmt_f(dG_rate_pose_B, ".4f")}\n')
+        # Paired (multi-mode sum across poses).
+        f.write(f'paired,total,{_fmt_f(k_off_paired)},,,'
+                f'{_fmt_f(dG_pmf_paired, ".4f")},'
+                f'{_fmt_f(dG_rate_paired, ".4f")}\n')
+    print(f'  csv -> {per_campaign_csv}')
